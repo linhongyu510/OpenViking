@@ -591,11 +591,17 @@ class VikingClient:
         path: Optional[str] = None,
         recursive: bool = False,
         node_limit: int = 1000,
+        show_all_hidden: bool = False,
     ) -> List[Dict[str, Any]]:
         """列出资源"""
         if path is None or path == "":
             path = viking_resource_prefix
-        entries = await self.client.ls(path, recursive=recursive, node_limit=node_limit)
+        entries = await self.client.ls(
+            path,
+            recursive=recursive,
+            node_limit=node_limit,
+            show_all_hidden=show_all_hidden,
+        )
         return entries
 
     async def stat(self, uri: str) -> Dict[str, Any]:

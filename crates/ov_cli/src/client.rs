@@ -156,6 +156,32 @@ pub struct CompileTaskStatus {
     pub error: Option<CompileErrorInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileTerminalStatus {
+    Completed,
+    Partial,
+    Incomplete,
+    Failed,
+}
+
+impl CompileTerminalStatus {
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Completed | Self::Partial)
+    }
+}
+
+impl CompileTaskStatus {
+    pub fn terminal_status(&self) -> Option<CompileTerminalStatus> {
+        match self.status.as_str() {
+            "completed" => Some(CompileTerminalStatus::Completed),
+            "partial" => Some(CompileTerminalStatus::Partial),
+            "incomplete" => Some(CompileTerminalStatus::Incomplete),
+            "failed" => Some(CompileTerminalStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct CompileCreateRequest<'a> {
     #[serde(rename = "from")]

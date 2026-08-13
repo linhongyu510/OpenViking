@@ -53,6 +53,8 @@ class ToolContext:
     memory_user_ids: list[str] | None = None  # Deprecated alias for memory_owner_user_ids.
     openviking_connection: dict[str, Any] | None = None
     channel_metadata: dict[str, Any] | None = None
+    iteration: int | None = None
+    iteration_limit: int | None = None
 
     def __post_init__(self) -> None:
         if self.memory_owner_user_ids is None and self.memory_user_ids is not None:

@@ -17,7 +17,7 @@ DEFAULT_COMPILE_REASON = (
 COMPILE_STAGING_ROOT = "__compile_staging__"
 COMPILE_WIKI_PAGE_ROOT = f"{COMPILE_STAGING_ROOT}/wiki_pages"
 OKF_VERSION = "0.1"
-TERMINAL_STATUSES = frozenset({"completed", "failed"})
+TERMINAL_STATUSES = frozenset({"completed", "partial", "incomplete", "failed"})
 
 
 class CompileLimits(BaseModel):
@@ -25,6 +25,7 @@ class CompileLimits(BaseModel):
 
     source_roots: int = 16
     source_catalog_entries: int = 200
+    coverage_inventory_entries: int = 20_000
     skill_files: int = 128
     skill_file_bytes: int = 8 * 1024 * 1024
     skill_total_bytes: int = 32 * 1024 * 1024
@@ -34,6 +35,7 @@ class CompileLimits(BaseModel):
     tool_uri_count: int = 32
     tool_result_bytes: int = 1024 * 1024
     tool_total_result_bytes: int = 8 * 1024 * 1024
+    adapted_input_bytes: int = 32 * 1024 * 1024
     output_pages: int = 128
     output_files: int = 128
     output_operations: int = 256
@@ -45,6 +47,9 @@ class CompileLimits(BaseModel):
     task_runtime_seconds: float = 40 * 60
     salvage_grace_seconds: float = 120
     cleanup_grace_seconds: float = 40
+    judge_timeout_seconds: float = 30
+    judge_input_chars: int = 120_000
+    iteration_extension: int = 20
     terminal_task_retention_seconds: float = 24 * 60 * 60
     terminal_task_records: int = 1000
 
@@ -206,15 +211,29 @@ class CompileTask(BaseModel):
     task_id: str
     principal_scope: str
     sanitized_request: SanitizedCompileRequest
-    status: Literal["accepted", "running", "committing", "completed", "failed"]
+    status: Literal[
+        "accepted",
+        "running",
+        "committing",
+        "completed",
+        "partial",
+        "incomplete",
+        "failed",
+    ]
     stage: str
     created_at: str
     updated_at: str
     result: CompileResult | None = None
     error: CompileErrorInfo | None = None
+    # Coverage is durable task-internal state.  It is intentionally excluded
+    # from public API responses and never rendered into the Compile target.
+    coverage_summary: dict[str, Any] | None = None
 
     def public_dict(self) -> dict[str, Any]:
-        data = self.model_dump(exclude={"principal_scope", "sanitized_request"}, exclude_none=True)
+        data = self.model_dump(
+            exclude={"principal_scope", "sanitized_request", "coverage_summary"},
+            exclude_none=True,
+        )
         if self.result is not None:
             data["result"] = self.result.model_dump(by_alias=True)
         return data
@@ -229,10 +248,25 @@ class CompileAccepted(BaseModel):
 
 
 class CompileFailure(RuntimeError):
-    def __init__(self, code: str, message: str, *, stage: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        stage: str,
+        result: CompileResult | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.stage = stage
+        # A batch write may have made a subset of files visible before a
+        # technical failure.  Preserve that observable side effect on failed
+        # tasks instead of presenting an empty result.
+        self.result = result
+
+
+class CompileIncomplete(CompileFailure):
+    """A bounded Compile ended without a safe business result."""
 
 
 def utc_now() -> str:
@@ -244,6 +278,7 @@ __all__ = [
     "CompileErrorInfo",
     "CompileFileDraft",
     "CompileFailure",
+    "CompileIncomplete",
     "CompileLimits",
     "CompileRequest",
     "CompileResult",

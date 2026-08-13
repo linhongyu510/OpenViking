@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Mapping
 
@@ -11,6 +13,7 @@ from pydantic import ValidationError
 
 from openviking.core.namespace import context_type_for_uri, relative_uri_path
 from openviking.core.skill_loader import SkillLoader, validate_skill_format
+from openviking.session.memory.dataclass import WikiLink
 from openviking.session.memory.utils.link_renderer import LinkRenderer
 from openviking.utils.path_safety import (
     safe_join_viking_uri,
@@ -20,6 +23,7 @@ from openviking.utils.path_safety import (
 from openviking.utils.skill_processor import validate_skill_name
 from openviking_cli.exceptions import OpenVikingError
 from vikingbot.agent.tools.base import Tool, ToolContext
+from vikingbot.compile.coverage import CoverageError, CoverageLedger, ReadReceipt
 from vikingbot.compile.models import (
     COMPILE_STAGING_ROOT,
     COMPILE_WIKI_PAGE_ROOT,
@@ -64,8 +68,17 @@ def _uri_in_roots(uri: str, roots: tuple[str, ...]) -> bool:
 
 def _skill_workspace_read_hint(uri: str) -> str | None:
     value = str(uri or "").strip()
-    if value.startswith("viking://skills/"):
-        value = value[len("viking://") :]
+    if value.startswith("viking://"):
+        segments = value[len("viking://") :].split("/")
+        if segments[:1] == ["skills"]:
+            skills_at = 0
+        elif segments[:2] == ["agent", "skills"]:
+            skills_at = 1
+        elif len(segments) >= 3 and segments[0] == "user" and segments[2] == "skills":
+            skills_at = 2
+        else:
+            return None
+        value = "/".join(segments[skills_at:])
     if not value.startswith("skills/"):
         return None
     try:
@@ -85,12 +98,18 @@ class CompileScopedTool(Tool):
         limits: CompileLimits,
         result_budget: dict[str, int],
         budget_lock: asyncio.Lock,
+        coverage: CoverageLedger | None = None,
+        review_views: Mapping[str, str | Callable[[], Awaitable[str]]] | None = None,
+        evidence_cache: dict[str, str] | None = None,
     ):
         self._tool = tool
         self._roots = roots
         self._limits = limits
         self._result_budget = result_budget
         self._budget_lock = budget_lock
+        self._coverage = coverage
+        self._review_views = dict(review_views or {})
+        self._evidence_cache = evidence_cache if evidence_cache is not None else {}
 
     @property
     def name(self) -> str:
@@ -132,16 +151,111 @@ class CompileScopedTool(Tool):
         if len(uris) > self._limits.tool_uri_count:
             return "Error: Compile tool URI limit exceeded."
         for uri in uris:
+            workspace_path = _skill_workspace_read_hint(uri)
+            if workspace_path:
+                return (
+                    "Error: Skill workspace files must be read with read_file using path "
+                    f'"{workspace_path}", not with an openviking_* tool.'
+                )
             if not _uri_in_roots(uri, self._roots):
-                workspace_path = _skill_workspace_read_hint(uri)
-                if workspace_path:
-                    return (
-                        "Error: Skill workspace files must be read with read_file using path "
-                        f'"{workspace_path}", not with an openviking_* tool.'
-                    )
                 return f"Error: URI is outside the Compile task scope: {uri}"
 
-        result = await self._tool.execute(tool_context, **kwargs)
+        pending_receipts: dict[str, ReadReceipt] = {}
+        pending_evidence: dict[str, str] = {}
+        pending_non_substantive: list[tuple[tuple[str, ...], str]] = []
+        if self.name == "openviking_multi_read" and self._coverage is not None:
+            requested = [str(value).rstrip("/") for value in kwargs.get("uris", [])]
+            for uri in requested:
+                # Reads under the target catalog are useful for incremental
+                # compilation but are not source review units.  They must stay
+                # readable without manufacturing coverage receipts.
+                try:
+                    units = self._units_for_locator(uri)
+                except CoverageError:
+                    continue
+                allowed = (
+                    self._limits.adapted_input_bytes
+                    if uri in self._review_views
+                    else self._limits.tool_result_bytes
+                )
+                known_sizes = [
+                    unit.discovered_bytes
+                    for unit in units
+                    if unit.discovered_bytes is not None
+                ]
+                if known_sizes and max(known_sizes) > allowed:
+                    return (
+                        "Error: Compile review unit exceeds its safe read budget; use a "
+                        "Harness-verified summary or report a concrete filtering reason: "
+                        f"{uri} ({max(known_sizes)} bytes > {allowed} bytes)."
+                    )
+            adapted = [uri for uri in requested if uri in self._review_views]
+            delegated = [uri for uri in requested if uri not in self._review_views]
+            sections: list[str] = []
+            section_bytes = 0
+
+            def append_section(*parts: str) -> bool:
+                nonlocal section_bytes
+                added = sum(len(part.encode("utf-8")) for part in parts) + len(parts)
+                if section_bytes + added > self._limits.tool_result_bytes:
+                    return False
+                sections.extend(parts)
+                section_bytes += added
+                return True
+
+            for uri in adapted:
+                view = self._review_views[uri]
+                content = await view() if callable(view) else view
+                units = self._units_for_locator(uri)
+                if not content.strip():
+                    if not append_section(
+                        f"--- START OF {uri} ---",
+                        "[Harness: no substantive Codex conversation content]",
+                        f"--- END OF {uri} ---",
+                    ):
+                        return "Error: Compile tool result exceeds the per-call size limit."
+                    pending_non_substantive.append(
+                        (
+                            tuple(unit.unit_id for unit in units),
+                            "Codex adapter inspected the full rollout and verified that it "
+                            "contains only metadata or control records",
+                        )
+                    )
+                    continue
+                if not append_section(
+                    f"--- START OF {uri} ---",
+                    content,
+                    f"--- END OF {uri} ---",
+                ):
+                    return "Error: Compile tool result exceeds the per-call size limit."
+                for unit in units:
+                    snapshot = next(
+                        item
+                        for item in self._coverage.snapshots
+                        if item.source_id == unit.source_id
+                    )
+                    pending_receipts[unit.unit_id] = ReadReceipt.for_content(
+                        snapshot, unit.unit_id, content
+                    )
+                    pending_evidence[unit.unit_id] = content
+            if delegated:
+                # Execute one URI per underlying call.  This preserves per-URI
+                # success attribution: content from one untrusted source cannot
+                # forge another URI's START/END markers and earn its receipt.
+                for uri in delegated:
+                    rendered_result = str(
+                        await self._tool.execute(tool_context, **{**kwargs, "uris": [uri]})
+                    )
+                    if not append_section(rendered_result):
+                        return "Error: Compile tool result exceeds the per-call size limit."
+                    for receipt in self._receipts_for_single_read(uri, rendered_result):
+                        pending_receipts[receipt.unit_id] = receipt
+                        pending_evidence[receipt.unit_id] = self._single_read_content(
+                            uri, rendered_result
+                        )
+            result = "\n".join(sections)
+        else:
+            result = await self._tool.execute(tool_context, **kwargs)
         if (
             isinstance(result, str)
             and result.startswith("Error")
@@ -157,7 +271,265 @@ class CompileScopedTool(Tool):
             if total > self._limits.tool_total_result_bytes:
                 return "Error: Compile task tool-result budget exceeded."
             self._result_budget["bytes"] = total
+            # A read counts only after the exact result has passed every delivery
+            # budget and is about to be returned to the model.  The batch method
+            # pre-validates all receipts before mutating the ledger.
+            if self._coverage is not None and pending_receipts:
+                self._coverage.mark_reviewed(
+                    tuple(pending_receipts),
+                    pending_receipts,
+                    iteration=tool_context.iteration,
+                )
+                self._evidence_cache.update(pending_evidence)
+            if self._coverage is not None:
+                for unit_ids, reason in pending_non_substantive:
+                    self._coverage.mark_harness_non_substantive(
+                        unit_ids,
+                        reason,
+                        iteration=tool_context.iteration,
+                    )
         return rendered
+
+    def _units_for_locator(self, uri: str):
+        assert self._coverage is not None
+        units = tuple(unit for unit in self._coverage.units if unit.locator == uri)
+        if not units:
+            raise CoverageError(f"read URI is not a discovered review unit: {uri}")
+        return units
+
+    @staticmethod
+    def _single_read_content(uri: str, rendered: str) -> str:
+        start = f"--- START OF {uri} ---\n"
+        end = f"\n--- END OF {uri} ---"
+        start_at = rendered.find(start)
+        end_at = rendered.rfind(end)
+        if start_at < 0 or end_at < start_at + len(start):
+            return ""
+        return rendered[start_at + len(start) : end_at]
+
+    def _receipts_for_single_read(self, uri: str, rendered: str) -> tuple[ReadReceipt, ...]:
+        if self._coverage is None or rendered.lstrip().startswith("Error"):
+            return ()
+        content = self._single_read_content(uri, rendered)
+        if not content or content.lstrip().startswith("ERROR:"):
+            return ()
+        try:
+            units = self._units_for_locator(uri)
+        except CoverageError:
+            return ()
+        receipts: list[ReadReceipt] = []
+        try:
+            for unit in units:
+                snapshot = next(
+                    item
+                    for item in self._coverage.snapshots
+                    if item.source_id == unit.source_id
+                )
+                receipts.append(ReadReceipt.for_content(snapshot, unit.unit_id, content))
+            return tuple(receipts)
+        except CoverageError:
+            # The unit remains pending when a discovered content digest no
+            # longer matches what was delivered.
+            return ()
+
+
+class ReportCoverageTool(Tool):
+    """Let the agent account for units without restating the full ledger."""
+
+    def __init__(self, coverage: CoverageLedger):
+        self.coverage = coverage
+
+    @property
+    def name(self) -> str:
+        return "report_compile_coverage"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Account for discovered Compile review units. Use skip only with a concrete, "
+            "auditable filtering reason. Use cover only with a Harness-verified summary."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["skip", "cover", "status"]},
+                "unit_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 200,
+                },
+                "reason": {"type": "string", "maxLength": 1200},
+                "summary_unit_id": {"type": "string"},
+                "source_id": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            "required": ["action"],
+        }
+
+    async def execute(
+        self,
+        tool_context: ToolContext,
+        action: str,
+        unit_ids: list[str] | None = None,
+        reason: str | None = None,
+        summary_unit_id: str | None = None,
+        source_id: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        try:
+            if action == "skip":
+                if len(unit_ids or []) > 200 or len(reason or "") > 1200:
+                    return "Error: Coverage skip exceeds the per-call reporting limit."
+                self.coverage.skip(
+                    unit_ids or [], reason or "", iteration=tool_context.iteration
+                )
+            elif action == "cover":
+                if len(unit_ids or []) > 200:
+                    return "Error: Coverage cover exceeds the per-call reporting limit."
+                self.coverage.cover(
+                    unit_ids or [],
+                    summary_unit_id or "",
+                    iteration=tool_context.iteration,
+                )
+            elif action != "status":
+                return f"Error: Unsupported coverage action: {action}"
+        except CoverageError as exc:
+            return f"Error: Invalid coverage report: {exc}"
+        summary = self.coverage.summary()
+        issues = [
+            issue if len(issue) <= 600 else issue[:600] + "..."
+            for issue in summary["issues"][:8]
+        ]
+        visible_units = [
+            unit
+            for unit in self.coverage.units
+            if source_id is None or unit.source_id == source_id
+        ][offset : offset + limit]
+        return json.dumps(
+            {
+                "accepted": True,
+                "counts": summary["counts"],
+                "complete": summary["complete"],
+                "issues": issues,
+                "units": [
+                    {
+                        "unit_id": unit.unit_id,
+                        "source_id": unit.source_id,
+                        "locator": unit.locator,
+                        "kind": unit.kind,
+                        "status": self.coverage.status(unit.unit_id).value,
+                    }
+                    for unit in visible_units
+                ],
+                "next_offset": (
+                    offset + len(visible_units)
+                    if offset + len(visible_units) < len(
+                        [
+                            unit
+                            for unit in self.coverage.units
+                            if source_id is None or unit.source_id == source_id
+                        ]
+                    )
+                    else None
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+
+class RequestCompileExtensionTool(Tool):
+    """Request one bounded extension from an independent fresh-context judge."""
+
+    def __init__(
+        self,
+        *,
+        coverage: CoverageLedger,
+        extend: Callable[[Mapping[str, Any]], Awaitable[tuple[bool, str]]],
+        apply_extension: Callable[[], int],
+        near_limit: int = 5,
+    ):
+        self.coverage = coverage
+        self.extend = extend
+        self.apply_extension = apply_extension
+        self.near_limit = near_limit
+        self.used = False
+        self._lock = asyncio.Lock()
+
+    @property
+    def name(self) -> str:
+        return "request_compile_extension"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Near the normal iteration limit, request one bounded extension for genuinely "
+            "long Compile work. The extension never increases the wall-clock deadline."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        field = {"type": "string", "minLength": 1, "maxLength": 1200}
+        return {
+            "type": "object",
+            "properties": {
+                "reason": field,
+                "completed_work": field,
+                "remaining_work": field,
+                "next_actions": field,
+            },
+            "required": ["reason", "completed_work", "remaining_work", "next_actions"],
+        }
+
+    async def execute(
+        self,
+        tool_context: ToolContext,
+        reason: str,
+        completed_work: str,
+        remaining_work: str,
+        next_actions: str,
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        async with self._lock:
+            if self.used:
+                return "Error: The Compile iteration extension has already been decided."
+            iteration = int(tool_context.iteration or 0)
+            limit = int(tool_context.iteration_limit or 0)
+            if limit <= 0 or limit - iteration > self.near_limit:
+                return (
+                    "Error: Request an extension only near the normal iteration limit; "
+                    f"currently at iteration {iteration}/{limit}."
+                )
+            self.used = True
+            packet = {
+                "iteration": iteration,
+                "iteration_limit": limit,
+                "coverage": self.coverage.summary(),
+                "reason": reason,
+                "completed_work": completed_work,
+                "remaining_work": remaining_work,
+                "next_actions": next_actions,
+            }
+            try:
+                approved, explanation = await self.extend(packet)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return f"Extension denied because the independent review failed: {exc}"
+            if not approved:
+                return f"Extension denied: {explanation[:600]}"
+            new_limit = self.apply_extension()
+            return (
+                f"Extension approved. The request-local iteration limit is now {new_limit}; "
+                "continue the remaining work and submit a bounded result."
+            )
 
 
 class SubmitWikiBundleTool(Tool):
@@ -174,6 +546,10 @@ class SubmitWikiBundleTool(Tool):
         workspace_baseline: set[str] | None = None,
         wiki_uri_resolver: Callable[[str], Awaitable[bool]] | None = None,
         exec_enabled: bool = True,
+        coverage: CoverageLedger | None = None,
+        quality_judge: (
+            Callable[[WikiBundleDraft, list[bytes | None]], Awaitable[tuple[str, str]]] | None
+        ) = None,
     ):
         self.source_ids = source_ids
         self.catalog_uris = catalog_uris
@@ -190,9 +566,25 @@ class SubmitWikiBundleTool(Tool):
         )
         self.wiki_uri_resolver = wiki_uri_resolver
         self.exec_enabled = exec_enabled
+        self.coverage = coverage
+        self.quality_judge = quality_judge
         self.bundle: WikiBundleDraft | None = None
         self.file_payloads: list[bytes | None] = []
         self.skill_name: str | None = None
+        self.warnings: list[str] = []
+        self.candidate_bundle: WikiBundleDraft | None = None
+        self.candidate_file_payloads: list[bytes | None] = []
+        self.candidate_skill_name: str | None = None
+        self.candidate_warnings: list[str] = []
+        self.candidate_partial_reason: str | None = None
+        self.candidate_coverage_issue: str | None = None
+        self._judge_calls = 0
+        self._revision_requested = False
+        self._last_candidate_hash: str | None = None
+        self._last_submit_iteration: int | None = None
+        self._lock = asyncio.Lock()
+        self.requires_partial = False
+        self.partial_reason: str | None = None
 
     @property
     def _is_skill_target(self) -> bool:
@@ -295,26 +687,136 @@ class SubmitWikiBundleTool(Tool):
         **kwargs: Any,
     ) -> str:
         del kwargs
+        async with self._lock:
+            if (
+                tool_context.iteration is not None
+                and self._last_submit_iteration == tool_context.iteration
+            ):
+                return (
+                    "Error: Only one Compile submission is evaluated per iteration. "
+                    "Read the prior tool result before submitting again."
+                )
+            self._last_submit_iteration = tool_context.iteration
+            if self.bundle is not None:
+                return "Compile bundle was already accepted; duplicate submission ignored."
+            return await self._execute_locked(
+                tool_context, pages=pages, files=files, links=links
+            )
+
+    async def _execute_locked(
+        self,
+        tool_context: ToolContext,
+        *,
+        pages: list[dict[str, Any]] | None,
+        files: list[dict[str, Any]] | None,
+        links: list[dict[str, Any]] | None,
+    ) -> str:
         self.bundle = None
         self.file_payloads = []
         self.skill_name = None
+        self.warnings = []
+        self.requires_partial = False
+        self.partial_reason = None
         raw_links = links or []
+        parsed_links: list[WikiLink] = []
         for index, link in enumerate(raw_links):
             if not isinstance(link, Mapping) or set(link) - _LINK_FIELDS:
-                return f"Error: links[{index}] contains unknown fields."
+                self.warnings.append(
+                    f"Dropped invalid optional links[{index}]: unknown fields or non-object value."
+                )
+                continue
+            try:
+                parsed_links.append(WikiLink.model_validate(link))
+            except ValidationError as exc:
+                self.warnings.append(
+                    f"Dropped invalid optional links[{index}]: {exc.errors()[0]['msg']}."
+                )
         try:
             bundle = WikiBundleDraft.model_validate(
-                {"pages": pages or [], "files": files or [], "links": raw_links}
+                {
+                    "pages": pages or [],
+                    "files": files or [],
+                    "links": [link.model_dump() for link in parsed_links],
+                }
             )
             await self._validate_workspace_manifest(
                 bundle,
                 tool_context=tool_context,
             )
             bundle = await self._materialize_page_bodies(bundle, tool_context=tool_context)
-            payloads = await self._validate_bundle(bundle, tool_context=tool_context)
+            bundle, payloads, link_warnings = await self._validate_bundle(
+                bundle, tool_context=tool_context
+            )
+            self.warnings.extend(link_warnings)
         except (ValidationError, ValueError) as exc:
             kind = "Skill" if self._is_skill_target else "Wiki"
             return f"Error: Invalid {kind} bundle: {exc}"
+        self.candidate_bundle = bundle
+        self.candidate_file_payloads = payloads
+        self.candidate_skill_name = self.skill_name
+        self.candidate_warnings = list(self.warnings)
+        if self.coverage is not None:
+            gate_error = self.coverage.gate_error(before_iteration=tool_context.iteration)
+            # Preserve the gate result from the exact submission turn.  A
+            # concurrently executing read may update the live Ledger after the
+            # candidate was authored, but that future evidence cannot justify
+            # this candidate during iteration-limit recovery.
+            self.candidate_coverage_issue = gate_error
+            if gate_error:
+                return (
+                    "Error: Coverage gate rejected the bundle. Review or account for the "
+                    f"remaining units, then resubmit. {gate_error[:2000]}"
+                )
+        else:
+            self.candidate_coverage_issue = None
+
+        candidate_hasher = hashlib.sha256(bundle.model_dump_json().encode("utf-8"))
+        for payload in payloads:
+            candidate_hasher.update(b"\0inline\0" if payload is None else payload)
+        candidate_hash = candidate_hasher.hexdigest()
+        if self.quality_judge is not None:
+            if self._revision_requested and candidate_hash == self._last_candidate_hash:
+                self.warnings.append(
+                    "Quality review suggested a revision; the agent kept the submitted result."
+                )
+                self.requires_partial = True
+                self.partial_reason = "The agent kept a result with unresolved quality findings."
+            elif self._judge_calls >= 2:
+                self.warnings.append(
+                    "Quality review reached its two-call limit; the latest safe result was kept."
+                )
+                self.requires_partial = True
+                self.partial_reason = "Quality review did not converge within one revision."
+            else:
+                try:
+                    verdict, feedback = await self.quality_judge(bundle, payloads)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    verdict, feedback = (
+                        "pass_with_warning",
+                        f"Quality review was unavailable after retry: {exc}",
+                    )
+                self._judge_calls += 1
+                if verdict == "revise" and self._judge_calls == 1:
+                    self._revision_requested = True
+                    self._last_candidate_hash = candidate_hash
+                    self.partial_reason = feedback or "Quality review requested a revision."
+                    self.candidate_partial_reason = self.partial_reason
+                    return (
+                        "Error: Quality review found material issues. You may revise once, or "
+                        f"resubmit unchanged to keep this safe result. {feedback[:1600]}"
+                    )
+                if verdict == "revise":
+                    self.warnings.append(
+                        "Quality review still found material issues after the bounded revision."
+                    )
+                    self.requires_partial = True
+                    self.partial_reason = (
+                        "Material quality findings remain after the bounded revision."
+                    )
+                elif verdict == "pass_with_warning" and feedback:
+                    self.warnings.append(feedback[:1600])
         self.bundle = bundle
         self.file_payloads = payloads
         if self._is_skill_target:
@@ -412,13 +914,14 @@ class SubmitWikiBundleTool(Tool):
         *,
         tool_context: ToolContext,
         label: str,
+        max_bytes: int,
     ) -> bytes:
         try:
             relative = _normalize_workspace_path(workspace_path)
             if tool_context.sandbox_manager is None:
                 raise ValueError("task sandbox is unavailable")
             sandbox = await tool_context.sandbox_manager.get_sandbox(tool_context.session_key)
-            return await sandbox.read_file_bytes(relative)
+            return await sandbox.read_file_bytes(relative, max_bytes=max_bytes)
         except ValueError:
             raise
         except Exception as exc:
@@ -436,6 +939,7 @@ class SubmitWikiBundleTool(Tool):
             if file.workspace_path is not None
         }
         pages = []
+        page_bytes = 0
         for page in bundle.pages:
             if self.require_workspace_pages and page.body_markdown is not None:
                 raise ValueError(
@@ -443,6 +947,10 @@ class SubmitWikiBundleTool(Tool):
                     "submitted using body_workspace_path instead of inline Markdown"
                 )
             if page.body_workspace_path is None:
+                assert page.body_markdown is not None
+                page_bytes += len(page.body_markdown.encode("utf-8"))
+                if page_bytes > self.limits.output_total_bytes:
+                    raise ValueError("draft content size limit exceeded")
                 pages.append(page)
                 continue
             workspace_path = _normalize_workspace_path(page.body_workspace_path)
@@ -455,7 +963,9 @@ class SubmitWikiBundleTool(Tool):
                 workspace_path,
                 tool_context=tool_context,
                 label=f"page {page.page_id} body",
+                max_bytes=self.limits.output_total_bytes - page_bytes,
             )
+            page_bytes += len(raw)
             try:
                 body = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -469,7 +979,7 @@ class SubmitWikiBundleTool(Tool):
 
     async def _validate_bundle(
         self, bundle: WikiBundleDraft, *, tool_context: ToolContext
-    ) -> list[bytes | None]:
+    ) -> tuple[WikiBundleDraft, list[bytes | None], list[str]]:
         target_type = context_type_for_uri(self.target_uri)
         if len(bundle.pages) > self.limits.output_pages:
             raise ValueError("page limit exceeded")
@@ -569,6 +1079,7 @@ class SubmitWikiBundleTool(Tool):
                     file.workspace_path or "",
                     tool_context=tool_context,
                     label=f"file {index}",
+                    max_bytes=self.limits.output_total_bytes - total_bytes,
                 )
                 content_bytes = payload
             total_bytes += len(content_bytes)
@@ -589,36 +1100,40 @@ class SubmitWikiBundleTool(Tool):
         if target_type == "skill":
             self.skill_name = self._validate_skill_bundle(bundle, file_payloads)
         page_by_id = {page.page_id: page for page in bundle.pages}
-        link_errors: list[str] = []
+        valid_links: list[WikiLink] = []
+        link_warnings: list[str] = []
         for index, link in enumerate(bundle.links):
             prefix = f"links[{index}]"
+            error: str | None = None
             if link.f is None or link.t is None:
-                link_errors.append(f"{prefix} endpoints must be non-null")
-                continue
-            if link.f == link.t:
-                link_errors.append(f"{prefix} must not be a self-link")
-                continue
-            if link.f not in page_ids or link.t not in page_ids:
-                link_errors.append(f"{prefix} endpoints must reference bundle pages")
-                continue
-            if not link.match_text:
-                link_errors.append(f"{prefix} match_text is required")
-                continue
-            source_page = page_by_id[link.f]
-            if not LinkRenderer.can_render_link(
-                source_page.body_markdown,
-                link.match_text,
-                page_uris[link.f],
-                page_uris[link.t],
-            ):
-                link_errors.append(
-                    f"{prefix} from page {link.f} has unsatisfied anchor "
-                    f"{link.match_text!r}; use exact unprotected text or an existing "
-                    f"Markdown link to page {link.t}"
-                )
-        if link_errors:
-            raise ValueError(f"{len(link_errors)} invalid link(s): " + "; ".join(link_errors))
-        return file_payloads
+                error = "endpoints must be non-null"
+            elif link.f == link.t:
+                error = "must not be a self-link"
+            elif link.f not in page_ids or link.t not in page_ids:
+                error = "endpoints must reference bundle pages"
+            elif not link.match_text:
+                error = "match_text is required"
+            else:
+                source_page = page_by_id[link.f]
+                if not LinkRenderer.can_render_link(
+                    source_page.body_markdown,
+                    link.match_text,
+                    page_uris[link.f],
+                    page_uris[link.t],
+                ):
+                    error = (
+                        f"from page {link.f} has unsatisfied anchor {link.match_text!r}; "
+                        "use exact unprotected text or an existing Markdown link to the target"
+                    )
+            if error is not None:
+                link_warnings.append(f"Dropped invalid optional {prefix}: {error}.")
+            else:
+                valid_links.append(link)
+        return (
+            bundle.model_copy(update={"links": valid_links}),
+            file_payloads,
+            link_warnings,
+        )
 
     async def _is_wiki_uri(self, uri: str) -> bool:
         if uri in self.catalog_uris:
@@ -680,4 +1195,9 @@ class SubmitWikiBundleTool(Tool):
         return skill_name
 
 
-__all__ = ["CompileScopedTool", "SubmitWikiBundleTool"]
+__all__ = [
+    "CompileScopedTool",
+    "ReportCoverageTool",
+    "RequestCompileExtensionTool",
+    "SubmitWikiBundleTool",
+]

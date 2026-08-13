@@ -176,7 +176,9 @@ ov compile \
   --wait
 ```
 
-`--wait` polls the status endpoint until the task reaches a terminal state. `--timeout` limits only the local wait and does not cancel the server task. `--runtime-timeout` sets `runtime_timeout_seconds` for this run and can only shorten the server-owned runtime maximum; an excessive value is rejected with `429 RESOURCE_EXHAUSTED`. Reaching that deadline while the Agent is running, or reaching the configured AgentLoop iteration limit (`bot.agents.max_tool_iterations`, 50 by default), attempts to save eligible partial Resource output within a separate short grace period. The task fails if there is no eligible output to save; non-Resource targets and deadlines in later stages do not use this fallback.
+`--wait` polls until `completed`, `partial`, `incomplete`, or `failed`. `completed` and `partial` exit with code 0; human output labels `partial` as `usable output saved`. `incomplete` and `failed` exit non-zero. Human output lists the actual created, updated, and unchanged URIs. JSON output keeps the full task object. If an unsuccessful terminal task contains a `result` because writes became visible before an error, the CLI prints those side effects before the error.
+
+`--timeout` limits only the local wait and does not cancel the server task. `--runtime-timeout` sets `runtime_timeout_seconds` and can only shorten the server-owned runtime maximum; an excessive value is rejected with `429 RESOURCE_EXHAUSTED`. At the Agent iteration limit, a safe candidate is saved as `partial`; without one, eligible Resource workspace files are salvaged as `partial`, while no safe output produces `incomplete` with `AGENT_OUTPUT_INCOMPLETE`. An Agent runtime deadline can salvage Resource workspace files under the same `partial`/`incomplete` rule; non-Resource and later-stage timeouts are `failed`.
 
 The `direct` backend runs Compile `exec` commands with the Bot host's permissions. `bot.sandbox.backends.direct.allow_compile_exec` defaults to `false`, so Compile omits `exec` while ordinary Wiki and artifact generation can still run through file tools. A Skill that declares `requires.bins` or `requires.env` fails with `SKILL_CAPABILITY_UNAVAILABLE` before any command probe runs. Setting the option to `true` is an explicit unsafe opt-in; isolated backends with filesystem and network policies are recommended for CLI-dependent Skills. Admission overflow returns `429 RESOURCE_EXHAUSTED`.
 
@@ -239,13 +241,17 @@ curl http://localhost:1933/bot/v1/compile/cmp_01abc \
 
 Task lifecycle values are:
 
-| Status | Typical stages |
-|--------|----------------|
-| `accepted` | `queued` |
-| `running` | `loading_skill`, `collecting_context`, `agent`, `rendering` |
-| `committing` | `writing`, `refreshing`, `salvaging` |
-| `completed` | `completed`, `salvaged` |
-| `failed` | Stage where the failure occurred; the response contains `error.code` and `error.message` |
+| Status | Meaning / typical stages |
+|--------|--------------------------|
+| `accepted` | Non-terminal: `queued` |
+| `running` | Non-terminal: `loading_skill`, `collecting_context`, `agent`, `rendering` |
+| `committing` | Non-terminal: `writing`, `refreshing`, `salvaging` |
+| `completed` | Terminal success: fully validated output; `result` is present |
+| `partial` | Terminal success: usable output was saved after bounded salvage or an unresolved requested quality revision; `result.warnings` explains why |
+| `incomplete` | Terminal non-success: no complete safe output was available within the Agent budget; `error` is present and any `result` reports visible side effects |
+| `failed` | Terminal non-success: a technical, permission, contract, render, or commit failure; `error` is present and `result` may also report visible writes |
+
+Coverage details are intentionally absent from the public task schema. Callers should always inspect both `result` and `error` on terminal tasks because a failed commit is not guaranteed to be an all-or-nothing rollback.
 
 ### feedback()
 

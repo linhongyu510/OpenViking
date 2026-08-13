@@ -21,10 +21,11 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self, config: Any = None):
+    def __init__(self, config: Any = None, *, execute_post_call_hooks: bool = True):
         self._tools: dict[str, Tool] = {}
         self.langfuse = LangfuseClient.get_instance()
         self.config = config
+        self.execute_post_call_hooks = execute_post_call_hooks
 
     def register(self, tool: Tool) -> None:
         """
@@ -147,6 +148,8 @@ class ToolRegistry:
         memory_user_ids: list[str] | None = None,
         openviking_connection: dict[str, Any] | None = None,
         channel_metadata: dict[str, Any] | None = None,
+        iteration: int | None = None,
+        iteration_limit: int | None = None,
     ) -> str:
         """
         Execute a tool by name with given parameters.
@@ -185,6 +188,8 @@ class ToolRegistry:
             memory_user_ids=memory_user_ids,
             openviking_connection=openviking_connection,
             channel_metadata=dict(channel_metadata or {}),
+            iteration=iteration,
+            iteration_limit=iteration_limit,
         )
 
         # Langfuse tool call tracing - automatic for all tools
@@ -234,21 +239,24 @@ class ToolRegistry:
                 except Exception:
                     pass
 
-        hook_result = await hook_manager.execute_hooks(
-            context=HookContext(
-                event_type="tool.post_call",
-                session_key=session_key,
-                workspace_id=(
-                    sandbox_manager.to_workspace_id(session_key) if sandbox_manager else "shared"
+        if self.execute_post_call_hooks:
+            hook_result = await hook_manager.execute_hooks(
+                context=HookContext(
+                    event_type="tool.post_call",
+                    session_key=session_key,
+                    workspace_id=(
+                        sandbox_manager.to_workspace_id(session_key)
+                        if sandbox_manager
+                        else "shared"
+                    ),
+                    config=self.config,
+                    openviking_connection=openviking_connection,
                 ),
-                config=self.config,
-                openviking_connection=openviking_connection,
-            ),
-            tool_name=name,
-            params=params,
-            result=result,
-        )
-        result = hook_result.get("result")
+                tool_name=name,
+                params=params,
+                result=result,
+            )
+            result = hook_result.get("result")
         if isinstance(result, Exception):
             return f"Error executing {name}: {str(result)}"
         else:

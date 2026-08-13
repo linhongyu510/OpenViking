@@ -127,6 +127,7 @@ class AgentLoop:
         config: Config = None,
         eval: bool = False,
         mcp_servers: dict | None = None,
+        register_hooks: bool = True,
     ):
         """
         Initialize the AgentLoop with all required dependencies and configuration.
@@ -185,7 +186,8 @@ class AgentLoop:
             config=self.config,
         )
 
-        self._register_builtin_hooks()
+        if register_hooks:
+            self._register_builtin_hooks()
         self.sessions = session_manager or SessionManager(
             self.config.bot_data_path, sandbox_manager=sandbox_manager
         )
@@ -992,6 +994,7 @@ class AgentLoop:
             "total_tokens": 0,
         }
         write_exp_injected = False
+        extension_notice_sent = False
         stop_tools = set(stop_tool_names or [])
 
         def accumulate_token_usage(response: Any) -> None:
@@ -1004,6 +1007,26 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            has_tool = getattr(active_tools, "has", None)
+            if (
+                not extension_notice_sent
+                and callable(has_tool)
+                and has_tool("request_compile_extension")
+                and self.max_iterations - iteration <= 4
+            ):
+                extension_notice_sent = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The normal Compile iteration limit is approaching "
+                            f"({iteration}/{self.max_iterations}). If substantial ledger work "
+                            "genuinely remains, you may request the one bounded extension now; "
+                            "otherwise finish and submit the safest bounded result."
+                        ),
+                    }
+                )
 
             if publish_events:
                 await self.bus.publish_outbound(
@@ -1095,7 +1118,15 @@ class AgentLoop:
                 )
 
                 # Stage 2: Execute all tools in parallel
-                async def execute_single_tool(idx: int, tool_call):
+                current_iteration = iteration
+                current_iteration_limit = self.max_iterations
+
+                async def execute_single_tool(
+                    idx: int,
+                    tool_call,
+                    _iteration: int = current_iteration,
+                    _iteration_limit: int = current_iteration_limit,
+                ):
                     """Execute a single tool and track execution time."""
                     tool_execute_start_time = time.time()
                     tool_connection = (
@@ -1115,6 +1146,8 @@ class AgentLoop:
                         memory_owner_user_ids=memory_owner_user_ids,
                         openviking_connection=tool_connection,
                         channel_metadata=channel_metadata,
+                        iteration=_iteration,
+                        iteration_limit=_iteration_limit,
                     )
                     tool_execute_duration = (time.time() - tool_execute_start_time) * 1000
                     return idx, tool_call, result, tool_execute_duration

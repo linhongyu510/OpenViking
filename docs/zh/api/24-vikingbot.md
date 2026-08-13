@@ -173,7 +173,9 @@ ov compile \
   --wait
 ```
 
-`--wait` 会轮询状态接口，直到任务进入终态。`--timeout` 只限制本地等待时间，不会取消服务端任务；`--runtime-timeout` 用于设置本次任务的 `runtime_timeout_seconds`，只能缩短服务端拥有的最大运行时限，超限请求会以 `429 RESOURCE_EXHAUSTED` 拒绝。在 Agent 执行期间达到该时限，或达到配置的 AgentLoop 迭代上限（`bot.agents.max_tool_iterations`，默认 50）时，会在独立的短 grace period 内尝试保存符合条件的 Resource 阶段性产物；没有可保存产物时任务失败，非 Resource 目标以及后续阶段超时不使用该 fallback。
+`--wait` 会轮询到 `completed`、`partial`、`incomplete` 或 `failed`。`completed` 和 `partial` 的退出码为 0；human 输出会把 `partial` 标为 `usable output saved`。`incomplete` 和 `failed` 的退出码非 0。human 输出列出实际创建、更新和未变化的 URI，JSON 输出保留完整 task 对象。若非成功终态因错误前已有可见写入而携带 `result`，CLI 会先打印这些副作用，再打印错误。
+
+`--timeout` 只限制本地等待时间，不会取消服务端任务；`--runtime-timeout` 用于设置本次任务的 `runtime_timeout_seconds`，只能缩短服务端拥有的最大运行时限，超限请求会以 `429 RESOURCE_EXHAUSTED` 拒绝。达到 Agent iteration 上限时，安全 candidate 以 `partial` 保存；没有 candidate 时，符合条件的 Resource workspace 文件也可 salvage 为 `partial`，没有安全产物则以 `incomplete` 和 `AGENT_OUTPUT_INCOMPLETE` 结束。Agent runtime deadline 仅对 Resource 使用同样的 workspace `partial`/`incomplete` 规则；非 Resource 和后续阶段超时为 `failed`。
 
 `direct` backend 会以 Bot 宿主机权限执行 Compile 的 `exec` 命令。`bot.sandbox.backends.direct.allow_compile_exec` 默认为 `false`，此时 Compile 不会暴露 `exec`，但普通 Wiki 和产物文件整理仍可通过文件工具运行。声明了 `requires.bins` 或 `requires.env` 的 Skill 会在执行任何命令探测前以 `SKILL_CAPABILITY_UNAVAILABLE` 失败。将该选项设为 `true` 是明确的不安全 opt-in；依赖 CLI 的 Skill 推荐使用具备文件系统和网络策略的隔离 backend。超过 admission 上限时返回 `429 RESOURCE_EXHAUSTED`。
 
@@ -236,13 +238,17 @@ curl http://localhost:1933/bot/v1/compile/cmp_01abc \
 
 任务生命周期如下：
 
-| Status | 常见 Stage |
-|--------|------------|
-| `accepted` | `queued` |
-| `running` | `loading_skill`、`collecting_context`、`agent`、`rendering` |
-| `committing` | `writing`、`refreshing`、`salvaging` |
-| `completed` | `completed`、`salvaged` |
-| `failed` | 失败发生时的 Stage；响应包含 `error.code` 和 `error.message` |
+| Status | 含义 / 常见 Stage |
+|--------|-------------------|
+| `accepted` | 非终态：`queued` |
+| `running` | 非终态：`loading_skill`、`collecting_context`、`agent`、`rendering` |
+| `committing` | 非终态：`writing`、`refreshing`、`salvaging` |
+| `completed` | 成功终态：产物完整通过校验，包含 `result` |
+| `partial` | 成功终态：有界 salvage 或一次修订后仍未解决的质量问题下保存了可用产物，原因在 `result.warnings` 中 |
+| `incomplete` | 非成功终态：Agent 预算内没有完整安全产物；包含 `error`，若有 `result` 则表示可见副作用 |
+| `failed` | 非成功终态：技术、权限、契约、渲染或提交失败；包含 `error`，也可能通过 `result` 报告可见写入 |
+
+Coverage 细节有意不属于公开 task schema。调用方应同时检查终态 task 的 `result` 和 `error`，因为失败的提交不保证全部回滚。
 
 ### feedback()
 
