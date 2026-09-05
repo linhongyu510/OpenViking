@@ -202,6 +202,8 @@ class SemanticTreeExecutor:
         source_raw_contents: Optional[Mapping[tuple[str, int], str | bytes]] = None,
         materialize_content: bool = False,
     ):
+        if not aggregate_directory and recursive:
+            raise ValueError("aggregate_directory=False requires recursive=False")
         self._processor = processor
         self._context_type = context_type
         self._ctx = ctx
