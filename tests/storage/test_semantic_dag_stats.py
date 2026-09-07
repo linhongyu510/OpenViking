@@ -42,10 +42,14 @@ class _FakeVikingFS:
         self._tree = tree
         self._abstracts = abstracts or {}
         self.writes = []
+        # Records every directory listed, so a test can assert that a
+        # non-recursive run never descends past its target.
+        self.ls_calls = []
         self._async_agfs = self
 
     async def ls(self, uri, node_limit=None, ctx=None):
         del node_limit
+        self.ls_calls.append(uri)
         return self._tree.get(uri, [])
 
     async def write_file(self, path, content, ctx=None, lease_ref=None):
@@ -375,7 +379,6 @@ async def test_busy_parent_snapshot_preserves_changed_file_work(monkeypatch):
     assert processor.vectorized_files == [changed]
     assert processor.vectorized_dirs == []
     assert executor.get_stats().total_nodes == 2
-
 
 
 @pytest.mark.asyncio
