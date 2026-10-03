@@ -211,11 +211,11 @@ async def test_file_only_message_drives_real_dag_non_recursively_without_requeue
         lambda: fake_fs,
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        "openviking.storage.queuefs.semantic_executor.get_viking_fs",
         lambda: fake_fs,
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        "openviking.storage.queuefs.semantic_executor.get_openviking_config",
         lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
     )
     monkeypatch.setattr(
@@ -227,7 +227,7 @@ async def test_file_only_message_drives_real_dag_non_recursively_without_requeue
         lambda msg: False,
     )
 
-    processor = SemanticProcessor(max_concurrent_llm=1)
+    processor = _processor(max_concurrent_llm=1)
     summary_mock = AsyncMock(return_value={"name": "changed.md", "summary": "summary"})
     requeue_mock = AsyncMock()
     monkeypatch.setattr(processor, "_generate_single_file_summary", summary_mock)
@@ -243,7 +243,7 @@ async def test_file_only_message_drives_real_dag_non_recursively_without_requeue
 
     await asyncio.wait_for(processor.on_dequeue(msg.to_dict()), timeout=0.5)
 
-    stats = SemanticProcessor.consume_dag_stats(uri=root_uri)
+    stats = SemanticProcessor.consume_tree_stats(uri=root_uri)
     assert stats is not None
     assert (
         stats.total_nodes,

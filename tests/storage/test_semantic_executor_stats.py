@@ -350,7 +350,7 @@ def test_non_aggregation_rejects_recursive_execution():
         ValueError,
         match="aggregate_directory=False requires recursive=False",
     ):
-        SemanticDagExecutor(
+        SemanticTreeExecutor(
             processor=processor,
             context_type="resource",
             max_concurrent_llm=2,
